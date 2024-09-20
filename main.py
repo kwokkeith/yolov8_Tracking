@@ -1,13 +1,11 @@
 import cv2
-
 from ultralytics import YOLO
 import supervision as sv
 import numpy as np
 import argparse
-from depthai_sdk import OakCamera
 import depthai as dai
 
-ispScale = (1,2)
+ispScale = (1,4) # use (1,2) for higher resolution
 camRes = dai.ColorCameraProperties.SensorResolution.THE_720_P
 camSocket = dai.CameraBoardSocket.CAM_A
 
@@ -16,9 +14,9 @@ cam_options = ['rgb', 'cam', 'undistort']
 parser = argparse.ArgumentParser()
 parser.add_argument("-cam", "--cam_input",
                     help="select camera input source for inference", default='cam', choices=cam_options)
-"""
 parser.add_argument("-conf", "--confidence_thresh",
                     help="set the confidence threshold", default=0.3, type=float)
+"""
 parser.add_argument("-iou", "--iou_thresh",
                     help="set the NMS IoU threshold", default=0.4, type=float)
 """
@@ -32,36 +30,13 @@ def main():
 
     args = parser.parse_args()
     cam_source = args.cam_input
+    min_confidence = args.confidence_thresh
 
     model = YOLO("best.pt")
 
     if cam_source == "cam":
         for result in model.track(source=0, show=True, stream=True, agnostic_nms=True):
-            
-            frame = result.orig_img
-            detections = sv.Detections.from_yolov8(result)
-
-            if result.boxes.id is not None:
-                detections.tracker_id = result.boxes.id.cpu().numpy().astype(int)
-            
-            detections = detections[(detections.class_id != 60) & (detections.class_id != 0)]
-
-            labels = [
-                f"{tracker_id} {model.model.names[class_id]} {confidence:0.2f}"
-                for _, confidence, class_id, tracker_id
-                in detections
-            ]
-
-            frame = box_annotator.annotate(
-                scene=frame, 
-                detections=detections,
-                labels=labels
-            )
-
-            # line_counter.trigger(detections=detections)
-            # line_annotator.annotate(frame=frame, line_counter=line_counter)
-
-            cv2.imshow("yolov8", frame)
+            visualizeDetections(result, model, box_annotator, min_confidence)
 
             if (cv2.waitKey(30) == 27):
                 break
@@ -106,11 +81,9 @@ def main():
                 # Get frame dimensions
                 h, w = frame.shape[:2]
 
-
                 # Undistort image
                 new_camera_matrix, roi = cv2.getOptimalNewCameraMatrix(K, D, (w, h), 1, (w, h))
                 frame = cv2.undistort(frame, K, D, None, new_camera_matrix)
-
 
                 # crop image
                 x, y, w, h = roi
@@ -118,30 +91,7 @@ def main():
 
                 # Use YOLOv8 model to detect objects in the frame
                 result = model(frame)[0]
-                
-                detections = sv.Detections.from_yolov8(result)
-                print(detections)
-
-                frame = result.orig_img
-
-                if result.boxes.id is not None:
-                    detections.tracker_id = result.boxes.id.cpu().numpy().astype(int)
-            
-                detections = detections[(detections.class_id != 60) & (detections.class_id != 0)]
-
-                labels = [
-                    f"{tracker_id} {model.model.names[class_id]} {confidence:0.2f}"
-                    for _, confidence, class_id, tracker_id
-                    in detections
-                ]
-
-                frame = box_annotator.annotate(
-                    scene=frame, 
-                    detections=detections,
-                    labels=labels
-                )
-
-                cv2.imshow("yolov8", frame)
+                visualizeDetections(result, model, box_annotator, min_confidence)
 
                 if (cv2.waitKey(30) == 27):
                     break
@@ -160,28 +110,7 @@ def main():
                 results = model.track(source=q.get().getCvFrame(), stream=True, show=True, agnostic_nms=True)
                 
                 for result in results:
-                    frame = result.orig_img
-                    detections = sv.Detections.from_yolov8(result)
-                    print(detections)
-
-                    if result.boxes.id is not None:
-                        detections.tracker_id = result.boxes.id.cpu().numpy().astype(int)
-                
-                    detections = detections[(detections.class_id != 60) & (detections.class_id != 0)]
-
-                    labels = [
-                        f"{tracker_id} {model.model.names[class_id]} {confidence:0.2f}"
-                        for _, confidence, class_id, tracker_id
-                        in detections
-                    ]
-
-                    frame = box_annotator.annotate(
-                        scene=frame, 
-                        detections=detections,
-                        labels=labels
-                    )
-
-                    cv2.imshow("yolov8", frame)
+                    visualizeDetections(result, model, box_annotator, min_confidence)
 
                 if cv2.waitKey(1) == ord('q'):
                         break
@@ -194,7 +123,7 @@ def create_pipeline(calibData):
     cam.setIspScale(ispScale)
     cam.setBoardSocket(camSocket)
     cam.setResolution(camRes)
-    cam.setFps(40)
+    cam.setFps(20)
 
     manip = pipeline.create(dai.node.ImageManip)
     mesh, meshWidth, meshHeight = getMesh(calibData, cam.getIspSize())
@@ -213,14 +142,13 @@ def create_pipeline(calibData):
     return pipeline
 
 
-
 def getMesh(calibData, ispSize):
     M1 = np.array(calibData.getCameraIntrinsics(camSocket, ispSize[0], ispSize[1]))
     d1 = np.array(calibData.getDistortionCoefficients(camSocket))
     R1 = np.identity(3)
     mapX, mapY = cv2.initUndistortRectifyMap(M1, d1, R1, M1, ispSize, cv2.CV_32FC1)
 
-    meshCellSize = 16
+    meshCellSize = 128 # Mesh size, if increased then reduces complexity
     mesh0 = []
     # Creates subsampled mesh which will be loaded on to device to undistort the image
     for y in range(mapX.shape[0] + 1): # iterating over height of the image
@@ -254,6 +182,37 @@ def getMesh(calibData, ispSize):
     mesh = list(map(tuple, mesh0))
 
     return mesh, meshWidth, meshHeight
+
+
+def visualizeDetections(result, model, box_annotator, min_confidence):
+    frame = result.orig_img
+    detections = sv.Detections.from_yolov8(result)
+    
+    print(detections)
+
+    if result.boxes.id is not None:
+        detections.tracker_id = result.boxes.id.cpu().numpy().astype(int)
+
+    detections = detections[(detections.class_id != 60) & (detections.class_id != 0) & (detections.confidence >= min_confidence)]
+
+    if len(detections) == 0:
+        # Skip the current frame if no detections are found (Optimisation)
+        return
+
+    labels = [
+        f"{tracker_id} {model.model.names[class_id]} {confidence:0.2f}"
+        for _, confidence, class_id, tracker_id
+        in detections
+    ]
+
+    frame = box_annotator.annotate(
+        scene=frame, 
+        detections=detections,
+        labels=labels
+    )
+
+    cv2.imshow("yolov8", frame)
+
 
 if __name__ == "__main__":
     main()
